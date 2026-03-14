@@ -3,7 +3,6 @@ package suo5
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"math/rand"
@@ -404,6 +403,24 @@ func GetDialFunc(upstreamProxies []string) (rawhttp.ContextDialFunc, error) {
 	return dialMethod, nil
 }
 
+// chromeHTTP1Spec returns a Chrome ClientHelloSpec with the ALPN extension
+// patched to only advertise http/1.1 (no h2). This keeps the Chrome TLS
+// fingerprint while preventing HTTP/2 negotiation that breaks chunked streaming.
+func chromeHTTP1Spec() *utls.ClientHelloSpec {
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		// Fallback: should never happen for a built-in ID
+		return nil
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+			break
+		}
+	}
+	return &spec
+}
+
 func NewRawHttpClient(upstreamProxies []string, dialTimeout, timeout time.Duration) (*rawhttp.Client, error) {
 	dialMethod, err := GetDialFunc(upstreamProxies)
 	if err != nil {
@@ -427,9 +444,12 @@ func NewRawHttpClient(upstreamProxies []string, dialTimeout, timeout time.Durati
 			uTlsConn := utls.UClient(conn, &utls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         hostname,
-				MinVersion:         utls.VersionTLS10,
-				Renegotiation:      utls.RenegotiateOnceAsClient,
-			}, utls.HelloRandomizedNoALPN)
+				MinVersion:         utls.VersionTLS12,
+			}, utls.HelloCustom)
+			if err := uTlsConn.ApplyPreset(chromeHTTP1Spec()); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
 			if err := uTlsConn.Handshake(); err != nil {
 				_ = conn.Close()
 				return nil, err
@@ -447,11 +467,6 @@ func NewHttpTransport(upstreamProxies []string, timeout time.Duration) (*http.Tr
 	}
 
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS10,
-			Renegotiation:      tls.RenegotiateOnceAsClient,
-			InsecureSkipVerify: true,
-		},
 		DialContext: dialFunc,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -470,10 +485,13 @@ func NewHttpTransport(upstreamProxies []string, timeout time.Duration) (*http.Tr
 			tlsConfig := &utls.Config{
 				ServerName:         hostname,
 				InsecureSkipVerify: true,
-				Renegotiation:      utls.RenegotiateOnceAsClient,
-				MinVersion:         utls.VersionTLS10,
+				MinVersion:         utls.VersionTLS12,
 			}
-			uTlsConn := utls.UClient(conn, tlsConfig, utls.HelloRandomizedNoALPN)
+			uTlsConn := utls.UClient(conn, tlsConfig, utls.HelloCustom)
+			if err = uTlsConn.ApplyPreset(chromeHTTP1Spec()); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
 			if err = uTlsConn.HandshakeContext(ctx); err != nil {
 				_ = conn.Close()
 				return nil, err
